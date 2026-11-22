@@ -34,7 +34,13 @@ const source = { rules, default: 'delegate', escalation: 'capability', baseline:
 
 /** A workspace manifest for the meta-program expansion rows. */
 const manifest = JSON.stringify({
-  scripts: { deploy: 'sh ./deploy.sh', docs: 'git log --oneline -5', test: 'vitest run' },
+  scripts: {
+    deploy: 'sh ./deploy.sh',
+    docs: 'git log --oneline -5',
+    test: 'vitest run',
+    evil: 'powershell -enc ZXZpbA==',
+    nuke: 'rm -rf .',
+  },
 })
 const expandScript = makeScriptExpander({ workspaceRoot: WORKSPACE, readFile: () => manifest, onWarn: () => {} })
 const withScripts = { ...context, expandScript }
@@ -94,12 +100,23 @@ const rows = [
   ['bash', 'uniq ./a.txt D:/Elsewhere/out.txt', 'delegate', false, "rail: uniq's second positional argument is an output file"],
 
   // ── meta-program expansion: the body decides ─────────────────────────────
-  // The container's own `pnpm *` allow is inherited by its body statements,
-  // so expansion no longer withholds the escalation — a wide pnpm rule grants
-  // every script body it expands to.
+  // A container's own `pnpm *` allow may extend to a body statement only
+  // while that body stays inside the capability guardrails (read / in-scope
+  // local write / repo tooling). Opaque, destructive, unknown and external
+  // bodies are judged on their own and never inherit the runner's grant.
   ['bash', 'pnpm docs', 'allow', true, 'expanded to `git log`: benign body'],
-  ['bash', 'pnpm deploy', 'allow', true, 'expanded to `sh ./deploy.sh`: the inherited allow covers the body too'],
-  ['bash', 'pnpm test', 'allow', true, 'expanded to `vitest run`: same inheritance'],
+  ['bash', 'pnpm deploy', 'delegate', false, 'expanded to `sh ./deploy.sh`: an opaque body never inherits the runner allow'],
+  ['bash', 'pnpm test', 'allow', true, 'expanded to `vitest run`: repo tooling may inherit the runner allow'],
+  ['bash', 'pnpm evil', 'delegate', false, 'expanded to `powershell -enc …`: opaque body, no inheritance'],
+  ['bash', 'pnpm nuke', 'delegate', false, 'expanded to `rm -rf .`: destructive body, no inheritance'],
+
+  // ── structural / path regressions from the security review ───────────────
+  ['bash', 'cat <<EOF\n$(whoami)\nEOF', 'deny', false, 'unquoted heredoc body substitutions are judged and hit the deny rule'],
+  ['bash', "cat <<'EOF'\n$(whoami)\nEOF", 'allow', true, 'a quoted heredoc delimiter keeps the body as pure data'],
+  ['bash', 'echo hi > $OUT', 'delegate', false, 'a variable redirect target is unresolved (fail-closed)'],
+  ['bash', 'mkdir $HOME/evil', 'delegate', false, 'a variable path is unresolved (fail-closed)'],
+  ['pwsh', 'get-pwn.exe --delete-all', 'delegate', false, 'an unknown get-* program is not a read'],
+  ['bash', 'cat < D:/Elsewhere/x', 'allow', false, 'an input redirect outside the roots blocks the escalation'],
 
   // ── label laundering: things that look like a read but are not ───────────
   ['bash', 'cat ./notes.md', 'allow', true, 'an in-scope read still auto-escalates (the common case must survive)'],
@@ -114,7 +131,7 @@ console.log(`${pad('tool', 6)}${pad('sandbox', 10)}${pad('escalation', 12)}comma
 console.log('-'.repeat(120))
 
 const contextual = (command) =>
-  /^pnpm (docs|deploy|test)\b/.test(command) ? withScripts : context
+  /^pnpm (docs|deploy|test|evil|nuke)\b/.test(command) ? withScripts : context
 // pwsh 工具由宿主 preset 以 `process.platform !== 'win32'` 禁用：非 Windows 上工具不存在，
 // 这些行覆盖的是不可达路径，整行跳过（Windows CI 仍全量校验）。
 const WIN32 = process.platform === 'win32'
@@ -144,4 +161,3 @@ for (const [tool, command, expectedSandbox, expectedEscalation, note] of rows) {
 }
 console.log('-'.repeat(120))
 console.log(`verify-command-matrix: ${rows.length - skipped} rows checked${skipped > 0 ? ` (${skipped} pwsh rows skipped: tool is Windows-only)` : ''} (a mismatch would have thrown at its row)`)
-

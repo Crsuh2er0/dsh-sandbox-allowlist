@@ -54,6 +54,7 @@ import {
   noReadRuleIssues,
   resolveNoRead,
 } from '../lib/read-deny.mjs'
+import { decideNoRead } from '../lib/read-gate.mjs'
 import {
   stripDaclSddl,
   revokeWriteAces,
@@ -704,6 +705,14 @@ try {
     assert.equal(dhit('D:/VAULT/UP.TXT').action, 'deny', 'Windows dir matching is case-insensitive')
   }
 
+  // 回归：`\\?\` 是同一路径的扩展长度拼写，gate 必须按去前缀后的路径判定，
+  // 否则目录级 deny 规则可被前缀绕过。
+  if (win32) {
+    const gateRules = compileNoReadRules([{ pattern: 'D:\\Vault', action: 'deny' }])
+    assert.equal(decideNoRead(gateRules, 'read', '\\\\?\\D:\\Vault\\secret.txt')?.kind, 'deny', 'extended-length spelling still hits the dir rule')
+    assert.equal(decideNoRead(gateRules, 'read', '\\\\?\\UNC\\server\\share\\x.txt'), 'delegate', 'an unrelated UNC alias delegates')
+  }
+
   // breadth guards refuse whole-drive/whole-fs and every-file patterns
   assert.equal(noReadRuleIssues([{ pattern: 'D:\\', action: 'deny' }]).length, 1, 'drive-root dir rule refused')
   assert.equal(noReadRuleIssues([{ pattern: '/', action: 'deny' }]).length, 1, 'fs-root dir rule refused')
@@ -1148,6 +1157,11 @@ try {
     assert.equal(kind('docker ps'), 'read', 'docker ps is a read-only form')
     assert.equal(kind('docker run x'), 'external')
     assert.equal(kind('acme-unknown --flag'), 'unknown')
+    // 回归（High 4）：get-* 不再按前缀无条件判只读——只有显式白名单里的
+    // 可信 getter 才是 read，任意同名程序落回 unknown。
+    assert.equal(kind('get-pwn.exe --delete-all'), 'unknown', 'an arbitrary get-* program is not a read')
+    assert.equal(kind('get-anything'), 'unknown', 'a missing get-* program is not a read')
+    assert.equal(kind('get-childitem .'), 'read', 'the enumerated trusted getter stays a read')
 
     // 回归（M4）：git 的破坏性 pathspec 形式——checkout/restore 丢弃工作区改动
     assert.equal(kind('git checkout .'), 'destructive', 'checkout with a pathspec discards changes')
@@ -1236,6 +1250,23 @@ try {
     assert.equal(realHeredoc.statements.some((statement) => statement.text.includes('hello')), false, 'a real heredoc body is data, never a statement')
     assert.ok(realHeredoc.statements.some((statement) => statement.text.trim() === 'echo done'), 'statements after the heredoc body are analyzed')
 
+    // 回归（Critical 1）：未加引号的分隔符不抑制展开——heredoc 正文里的
+    // $(...) / 反引号仍会执行，必须递归判定；加引号的分隔符才是纯数据。
+    const expandingHeredoc = analyzeCommand('cat <<EOF\n$(whoami)\nEOF', 'bash', { inScope: () => true })
+    assert.ok(expandingHeredoc.statements.some((statement) => statement.program === 'whoami'), 'an unquoted heredoc body substitution is analyzed')
+    const backtickHeredoc = analyzeCommand('cat <<EOF\n`whoami`\nEOF', 'bash', { inScope: () => true })
+    assert.ok(backtickHeredoc.statements.some((statement) => statement.program === 'whoami'), 'backticks in an unquoted heredoc body are analyzed')
+    const quotedDelimiter = analyzeCommand("cat <<'EOF'\n$(whoami)\nEOF", 'bash', { inScope: () => true })
+    assert.equal(quotedDelimiter.statements.some((statement) => statement.program === 'whoami'), false, 'a quoted delimiter keeps the heredoc body as data')
+    assert.equal(quotedDelimiter.unresolved.length, 0, 'a quoted heredoc body is not unresolved')
+
+    // 回归（High 3）：变量路径 / 变量重定向目标不可解析，即使 inScope 宽松也是
+    // fail-closed（运行时才知道真实目标）。
+    const variableRedirect = analyzeCommand('echo hi > $OUT', 'bash', { inScope: () => true })
+    assert.ok(variableRedirect.unresolved.some((item) => item.kind === 'variable-path'), 'a variable redirect target is unresolved')
+    const variablePath = analyzeCommand('mkdir $HOME/evil', 'bash', { inScope: () => true })
+    assert.ok(variablePath.unresolved.some((item) => item.kind === 'variable-path'), 'a variable path token is unresolved')
+
     // 回归（C2）：链式重定向的每个目标都要单独过 scope 检查
     const chained = analyzeCommand('echo pwned > ./ok.txt>D:/Elsewhere/evil.txt', 'bash', {
       inScope: (token) => !token.startsWith('D:/Elsewhere'),
@@ -1265,6 +1296,9 @@ try {
     assert.equal(inScope('../../Elsewhere/x'), false, '.. escapes are resolved before the check')
     assert.equal(inScope('~/.ssh/id_rsa'), false, 'home-relative paths leave the workspace')
     assert.equal(inScope('/etc/passwd'), false, 'a POSIX absolute path has no known mapping')
+    assert.equal(inScope('$OUT'), false, 'a bare variable cannot be proven in scope')
+    assert.equal(inScope('$HOME/x'), false, 'a variable-prefixed path cannot be proven in scope')
+    assert.equal(inScope('D:/Repo/$DIR/x'), false, 'an embedded variable cannot be proven in scope')
     // 回归（L1）：无 cwd 时相对路径不可证明在界内（fail-closed）；POSIX 根的
     // 宿主上 POSIX 绝对路径可以正常比较。
     const noCwd = makeScopePredicate(['D:/Repo'], undefined)
@@ -1323,6 +1357,56 @@ try {
     assert.equal(laundered.escalate, false, 'an out-of-scope runner argument blocks the auto-escalation')
     const inScopeArg = decide({ source: { rules: [] }, tool: 'bash', command: 'pnpm save -- D:/Repo/ok.txt', phase: 'escalation', context: expandCtx })
     assert.equal(inScopeArg.escalate, true, 'an in-scope runner argument still auto-escalates')
+
+    // 回归（Critical 2）：容器 allow 只覆盖 runner 与护栏内的 body；opaque /
+    // destructive body 必须单独判定，不能被 `pnpm *` 洗白。
+    const containerCtx = {
+      ...context,
+      expandScript: makeScriptExpander({
+        workspaceRoot: 'D:/Repo',
+        readFile: () => JSON.stringify({
+          scripts: { evil: 'powershell -enc ZXZpbA==', nuke: 'rm -rf .', test: 'vitest run' },
+        }),
+        onWarn: () => {},
+      }),
+    }
+    const pnpmAllow = { rules: [{ pattern: 'pnpm *', action: 'allow' }], default: 'delegate' }
+    const containerDecision = (command, phase) => decide({
+      source: pnpmAllow, tool: 'bash', command, phase, context: containerCtx,
+    })
+    assert.notEqual(containerDecision('pnpm evil', 'sandbox').verdict, 'allow', 'an opaque script body is not laundered by the runner allow')
+    assert.equal(containerDecision('pnpm evil', 'escalation').escalate, false, 'an opaque script body never auto-escalates')
+    assert.notEqual(containerDecision('pnpm nuke', 'sandbox').verdict, 'allow', 'a destructive script body is not laundered')
+    assert.equal(containerDecision('pnpm nuke', 'escalation').escalate, false, 'a destructive script body never auto-escalates')
+    assert.equal(containerDecision('pnpm test', 'escalation').escalate, true, 'repo tooling may still inherit the runner allow')
+
+    // 回归（Critical 1 端到端）：heredoc 正文里的 deny 命令必须被拦下。
+    const heredocDecision = decide({
+      source: { rules: [{ pattern: 'whoami*', action: 'deny' }], default: 'delegate' },
+      tool: 'bash',
+      command: 'cat <<EOF\n$(whoami)\nEOF',
+      phase: 'sandbox',
+      context,
+    })
+    assert.equal(heredocDecision.verdict, 'deny', 'a deny rule reaches the unquoted heredoc body')
+
+    // 回归（High 3 / Medium 5 / High 4）：变量目标、越界输入重定向、伪 get-*
+    // 都不能自动升级。
+    assert.equal(
+      decide({ source: { rules: [] }, tool: 'bash', command: 'mkdir $HOME/evil', phase: 'escalation', context }).escalate,
+      false,
+      'a variable path never auto-escalates',
+    )
+    assert.equal(
+      decide({ source: { rules: [] }, tool: 'bash', command: 'cat < D:/Elsewhere/x', phase: 'escalation', context }).escalate,
+      false,
+      'an out-of-scope input redirect never auto-escalates',
+    )
+    assert.equal(
+      decide({ source: { rules: [] }, tool: 'pwsh', command: 'get-pwn.exe --delete-all', phase: 'escalation', context }).escalate,
+      false,
+      'an unknown get-* program never auto-escalates',
+    )
 
     const explained = explainDecision(denyWins)
     assert.match(explained, /判定：deny/, 'explainDecision renders the verdict')

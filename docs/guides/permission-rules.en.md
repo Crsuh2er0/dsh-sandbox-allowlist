@@ -189,9 +189,10 @@ Three hard constraints (**no rule can override them**; they always apply regardl
 configuration):
 1. a command referencing a **noRead read-denied target** is never auto-approved — escalation
    would also lift the read restriction, and `allow` rules do not lift this track either;
-2. a write/redirection target **outside the workspace and authorized directories** is not
-   auto-approved — the right fix is to add it under "Sandbox authorization → Authorized
-   directories", so the command is never refused by the sandbox in the first place;
+2. a write target or an input/output redirection target **outside the workspace and
+   authorized directories** is not auto-approved — the right fix is to add it under
+   "Sandbox authorization → Authorized directories", so the command is never refused by
+   the sandbox in the first place;
 3. a segment matching a `deny` / `ask` rule is not auto-approved.
 
 There is one more conservative rule: **a read-only command that names a path outside the
@@ -205,9 +206,11 @@ explicit `allow` rules still apply as written.
 
 **Metaprogram expansion**: `pnpm run <script>` / `pnpm <script>` reads the script text (with
 `pre`/`post` hooks) from the workspace `package.json` and judges by the real content. When
-the manifest cannot be read it stays conservative. Note: if the container command itself
-matches an `allow` rule, that authorization overrides the expanded script body (the cost of
-a broad rule).
+the manifest cannot be read it stays conservative. When the container command itself
+matches an `allow` rule, that authorization covers only the runner and body statements
+inside the guardrails (read-only, in-scope writes, the repository's own tooling).
+`opaque` / `destructive` / `unknown` / `external` bodies are judged on their own and never
+inherit the container grant.
 
 ### Official Auto review sessions (dsh 0.2.0+ optional layer)
 When a session runs under the official Auto review preset
